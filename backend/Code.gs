@@ -8,7 +8,8 @@ const SHEETS = {
   lsteps: { name: 'LSteps', headers: ['id', 'weekStart', 'weekEnd', 'checkDate', 'business', 'previous', 'current', 'limit', 'operator', 'inputAt', 'updatedAt', 'used', 'remaining', 'json'] },
   monitoring: { name: 'Monitoring', headers: ['id', 'userName', 'month', 'visited', 'recordDone', 'meetingRequired', 'meetingDone', 'reportDone', 'mailed', 'returned', 'officeSent', 'billingDone', 'billingSent', 'addOn', 'continueType', 'note', 'operator', 'inputAt', 'updatedAt', 'json'] },
   agencyNotices: { name: 'AgencyNotices', headers: ['id', 'userName', 'month', 'created', 'sent', 'note', 'json'] },
-  history: { name: 'History', headers: ['id', 'at', 'action', 'type', 'recordId', 'label', 'beforeJson', 'afterJson'] }
+  history: { name: 'History', headers: ['id', 'at', 'action', 'type', 'recordId', 'label', 'beforeJson', 'afterJson'] },
+  syncHistory: { name: 'SyncHistory', headers: ['at', 'result', 'expectedRevision', 'serverRevisionBefore', 'serverRevisionAfter', 'posts', 'workMetrics', 'followers', 'inquiries', 'lsteps', 'clientId'] }
 };
 
 function doGet() {
@@ -17,21 +18,34 @@ function doGet() {
 }
 
 function doPost(e) {
+  const lock = LockService.getScriptLock();
+  let locked = false;
   try {
+    lock.waitLock(30000);
+    locked = true;
     ensureAllSheets_();
     const request = JSON.parse((e.postData && e.postData.contents) || '{}');
     const action = request.action || '';
     if (action === 'loadData') return json_({ ok: true, data: { data: readData_(), updatedAt: readUpdatedAt_() } });
-    if (action === 'saveData') return json_({ ok: true, data: saveData_(request.data || {}) });
+    if (action === 'saveData') {
+      return json_({ ok: true, data: saveData_(request.data || {}, request.expectedUpdatedAt || '', request.clientId || '') });
+    }
     throw new Error('未対応の操作です: ' + action);
   } catch (error) {
     return json_({ ok: false, error: error.message || String(error) });
+  } finally {
+    if (locked) lock.releaseLock();
   }
 }
 
-function saveData_(data) {
+function saveData_(data, expectedUpdatedAt, clientId) {
+  const currentUpdatedAt = readUpdatedAt_();
+  if (expectedUpdatedAt && currentUpdatedAt && expectedUpdatedAt !== currentUpdatedAt) {
+    appendSyncHistory_('conflict', expectedUpdatedAt, currentUpdatedAt, '', data, clientId);
+    throw new Error('CONFLICT: 他の端末で先に更新されています。再読み込みして内容を確認してください。');
+  }
+
   const normalized = normalizeData_(data);
-  writeState_(normalized);
   writeRows_(SHEETS.posts, normalized.posts, postRow_);
   writeRows_(SHEETS.workMetrics, normalized.workMetrics, workMetricRow_);
   writeRows_(SHEETS.followers, normalized.followers, followerRow_);
@@ -40,7 +54,30 @@ function saveData_(data) {
   writeRows_(SHEETS.monitoring, normalized.monitoring, monitoringRow_);
   writeRows_(SHEETS.agencyNotices, normalized.agencyNotices, agencyNoticeRow_);
   writeHistory_(normalized.history);
-  return { data: readData_(), updatedAt: readUpdatedAt_() };
+  writeState_(normalized);
+
+  const updatedAt = readUpdatedAt_();
+  appendSyncHistory_('saved', expectedUpdatedAt, currentUpdatedAt, updatedAt, normalized, clientId);
+  return { data: readData_(), updatedAt: updatedAt };
+}
+
+function appendSyncHistory_(result, expectedRevision, beforeRevision, afterRevision, data, clientId) {
+  const sheet = targetSpreadsheet_().getSheetByName(SHEETS.syncHistory.name);
+  const counts = data || {};
+  sheet.appendRow([
+    new Date().toISOString(),
+    result || '',
+    expectedRevision || '',
+    beforeRevision || '',
+    afterRevision || '',
+    array_(counts.posts).length,
+    array_(counts.workMetrics).length,
+    array_(counts.followers).length,
+    array_(counts.inquiries).length,
+    array_(counts.lsteps).length,
+    clientId || ''
+  ]);
+  if (sheet.getLastRow() > 5001) sheet.deleteRows(2, sheet.getLastRow() - 5001);
 }
 
 function readData_() {
